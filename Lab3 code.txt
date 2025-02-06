@@ -1,0 +1,315 @@
+/*
+Lab 3
+*/
+
+#include "LSM6DS3.h"
+#include <PDM.h>
+#include <Arduino.h>
+#include <U8x8lib.h> //Display library
+#include <Wire.h> //I2C protocol library (the display uses I2C to interact with MCU)
+#include <ArduinoBLE.h>
+#include <PCF8563.h>
+#include <SPI.h>
+#include <SD.h>
+
+//battery -------------------------------------------------
+// Resistor values in your voltage divider (in ohms)
+const float R1 = 2880.0;  // a 2.2k and 680 resistor
+const float R2 = 10000.0;  // 10kΩ resistor
+// Reference voltage of the ADC (usually 5V or 3.3V)
+const float referenceVoltage = 3.3;
+
+//Accel/Gyro/Temp-----------------------------------------
+//Create a instance of class LSM6DS3
+LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
+
+//microphone ---------------------------------------------
+// default number of output channels
+static const char channels = 1;
+// default PCM output frequency
+static const int frequency = 16000;
+// Buffer to read samples into, each sample is 16-bits
+short sampleBuffer[512];
+// Number of audio samples read
+volatile int samplesRead;
+
+//Clock ---------------------------------------------------
+PCF8563 pcf;
+
+//OLED ---------------------------------------------
+U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(/* clock=*/ PIN_WIRE_SCL, /* data=*/
+PIN_WIRE_SDA, /* reset=*/ U8X8_PIN_NONE); // OLEDs without Reset of the Display
+bool systemON = true;
+
+//Bluetooth--------------------------------------------------
+BLEService ledService("19B10000-E8F2-537E-4F6C-D104768A1214"); // Bluetooth® Low Energy LED Service
+// Bluetooth® Low Energy LED Switch Characteristic - custom 128-bit UUID, read and writable by central
+BLEByteCharacteristic switchCharacteristic("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLEWrite);
+const int ledPin = LED_BUILTIN; // pin to use for the LED
+
+//SD card-------------------------------------------------------
+const int chipSelect = 2;
+
+void setup() {
+  // Initialize serial communication at 9600 bits per second:
+  Serial.begin(9600);
+  while (!Serial);
+    //Accel/Gyro/Temp-----------------------------------
+    //Call .begin() to configure the IMUs
+  if (myIMU.begin() != 0) {
+      Serial.println("Device error");
+  } else {
+      Serial.println("Device OK!");
+  }
+
+  //microphone ------------------------------------------------
+  // Configure the data receive callback
+  PDM.onReceive(onPDMdata);
+  // Optionally set the gain
+  // Defaults to 20 on the BLE Sense and 24 on the Portenta Vision Shield
+  // PDM.setGain(30);
+  // Initialize PDM with:
+  // - one channel (mono mode)
+  // - a 16 kHz sample rate for the Arduino Nano 33 BLE Sense
+  // - a 32 kHz or 64 kHz sample rate for the Arduino Portenta Vision Shield
+  if (!PDM.begin(channels, frequency)) {
+    Serial.println("Failed to start PDM!");
+    while (1);
+  }
+  
+  //OLED -------------------------------------------------
+  u8x8.begin();
+  u8x8.setFlipMode(1); // set number from 1 to 3, the screen word will rotary 180
+
+  //clock------------------------------------------------------------
+  pcf.init();//initialize the clock
+  pcf.stopClock();//stop the clock
+  //set time to to current
+  pcf.setYear(25);//set year
+  pcf.setMonth(3);//set month
+  pcf.setDay(4);//set day
+  pcf.setHour(19);//set hour
+  pcf.setMinut(33);//set minut
+  pcf.setSecond(0);//set second
+  pcf.startClock();//start the clock
+
+  //Bluetooth -----------------------------------------------
+  // set LED pin to output mode
+  pinMode(ledPin, OUTPUT);
+  // begin initialization
+  if (!BLE.begin()) {
+    Serial.println("starting Bluetooth® Low Energy module failed!");
+    while (1);
+  }
+  // set advertised local name and service UUID:
+  BLE.setLocalName("Manasa");
+  BLE.setAdvertisedService(ledService);
+  // add the characteristic to the service
+  ledService.addCharacteristic(switchCharacteristic);
+  // add service
+  BLE.addService(ledService);
+  // set the initial value for the characeristic:
+  switchCharacteristic.writeValue(0);
+  // start advertising
+  BLE.advertise();
+  Serial.println("BLE LED Peripheral");
+
+  //SD--------------------------------------------------------
+  Serial.print("Initializing SD card...");
+  if (!SD.begin(chipSelect)) {
+    Serial.println("initialization failed. Things to check:");
+    Serial.println("1. is a card inserted?");
+    Serial.println("2. is your wiring correct?");
+    Serial.println("3. did you change the chipSelect pin to match your shield or module?");
+    Serial.println("Note: press reset button on the board and reopen this Serial Monitor after fixing your issue!");
+    while (true);
+  }
+  Serial.println("initialization done.");
+}
+
+void loop() {
+  //SD-----------------------------------------------------
+  // make a string for assembling the data to log:
+  String dataString = "";
+
+  //clock -------------------------------------------------------
+  Time nowTime = pcf.getTime();//get current time
+  //print current time
+  Serial.print(nowTime.day);
+  dataString += nowTime.day;
+  Serial.print("/");
+  dataString += "/";
+  Serial.print(nowTime.month);
+  dataString += nowTime.month;
+  Serial.print("/");
+  dataString += "/";
+  Serial.print(nowTime.year);
+  dataString += nowTime.year;
+  Serial.print(" ");
+  dataString += " ";
+  Serial.print(nowTime.hour);
+  dataString += nowTime.hour;
+  Serial.print(":");
+  dataString += ":";
+  Serial.print(nowTime.minute);
+  dataString += nowTime.minute;
+  Serial.print(":");
+  dataString += ":";
+  Serial.println(nowTime.second);
+  dataString += nowTime.second;
+  dataString += ", ";
+
+  //Battery -------------------------------------------------
+  // Read the input on analog pin A0:
+  int sensorValue = analogRead(A0);
+  // Convert the ADC value to voltage:
+  float measuredVoltage = sensorValue * (referenceVoltage / 1023.0);
+  // Account for the voltage divider to get the actual battery voltage:
+  float batteryVoltage = measuredVoltage * ((R1 + R2) / R2);
+  // Print out the battery voltage:
+  Serial.print("Battery Voltage: ");
+  Serial.print(batteryVoltage);
+  Serial.println(" V");
+  if(batteryVoltage < 3.2)
+    systemON = false;
+
+  //microphone---------------------------------------------------------
+  dataString += "Microphone: ";
+  // Wait for samples to be read
+  if (samplesRead) {
+    // Print samples to the serial monitor or plotter
+    Serial.print("Microphone: ");
+    Serial.println(sampleBuffer[0]);
+    dataString += sampleBuffer[0];
+    // Clear the read count
+    samplesRead = 0;
+  }
+  dataString += ", ";
+
+  //Accel/Gyro/Temp-----------------------------------
+  //Thermometer
+  Serial.print("\nThermometer:\n");
+  Serial.print(" Degrees C1 = ");
+  Serial.println(myIMU.readTempC(), 4);
+  Serial.print(" Degrees F1 = ");
+  dataString += "Temp =  ";
+  Serial.println(myIMU.readTempF(), 4);
+  dataString += String(myIMU.readTempF());
+  dataString += ", ";
+  //Accelerometer
+  Serial.print("\nAccelerometer:\n");
+  Serial.print(" X1 = ");
+  Serial.println(myIMU.readFloatAccelX(), 4);
+  dataString += "AccX =  ";
+  dataString += String(myIMU.readFloatAccelX());
+  dataString += ", ";
+  Serial.print(" Y1 = ");
+  Serial.println(myIMU.readFloatAccelY(), 4);
+  dataString += "AccY =  ";
+  dataString += String(myIMU.readFloatAccelY());
+  dataString += ", ";
+  Serial.print(" Z1 = ");
+  Serial.println(myIMU.readFloatAccelZ(), 4);
+  dataString += "AccZ =  ";
+  dataString += String(myIMU.readFloatAccelZ());
+  dataString += ", ";
+  //Gyroscope
+  Serial.print("\nGyroscope:\n");
+  Serial.print(" X1 = ");
+  Serial.println(myIMU.readFloatGyroX(), 4);
+  dataString += "GyroX =  ";
+  dataString += String(myIMU.readFloatGyroX());
+  dataString += ", ";
+  Serial.print(" Y1 = ");
+  Serial.println(myIMU.readFloatGyroY(), 4);
+  dataString += "GyroY =  ";
+  dataString += String(myIMU.readFloatGyroY());
+  dataString += ", ";
+  Serial.print(" Z1 = ");
+  Serial.println(myIMU.readFloatGyroZ(), 4);
+  dataString += "GyroZ =  ";
+  dataString += String(myIMU.readFloatGyroZ());
+  dataString += "\n";
+
+
+
+  //OLED -------------------------------------------------
+  u8x8.setFont(u8x8_font_chroma48medium8_r); //try u8x8_font_px437wyse700a_2x2_r
+  u8x8.setCursor(0, 0); // It will start printing from (0,0) location
+  u8x8.print("Battery: ");
+  u8x8.print(batteryVoltage);
+  u8x8.print(" V");
+  u8x8.setCursor(0, 1); // (columns, row)
+  u8x8.print("System: ");
+  if(systemON)
+    u8x8.print("ON ");
+  else
+    u8x8.print("OFF");
+
+
+
+  //Bluetooth--------------------------------------------------
+  // listen for Bluetooth® Low Energy peripherals to connect:
+  BLEDevice central = BLE.central();
+  // if a central is connected to peripheral:
+  if (central) {
+    Serial.print("Connected to central: ");
+    // print the central's MAC address:
+    Serial.println(central.address());
+      // if the remote device wrote to the characteristic,
+      // use the value to control the LED:
+    if (switchCharacteristic.written()) {
+      if (switchCharacteristic.value()) {   // any value other than 0
+        Serial.println("LED on");
+        digitalWrite(ledPin, HIGH);         // will turn the LED on
+        systemON = true;
+      } else {                              // a 0 value
+        Serial.println(F("LED off"));
+        digitalWrite(ledPin, LOW);          // will turn the LED off
+        systemON = false;
+      }
+    }  
+  }
+  // when the central disconnects, print it out:
+  if(!central){
+    Serial.println(F("Not Connected from central: "));
+  }
+
+  //SD--------------------------------------------------------------------
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  if(systemON){
+    File dataFile = SD.open("datalog.txt", FILE_WRITE);
+
+    // if the file is available, write to it:
+    if (dataFile) {
+      dataFile.println(dataString);
+      dataFile.close();
+      // print to the serial port too:
+      Serial.println(dataString);
+    }
+    // if the file isn't open, pop up an error:
+    else {
+      Serial.println("error opening datalog.txt");
+    }
+  }
+
+  delay(1000); // Delay in between reads for stability
+}
+
+/**
+ * Callback function to process the data from the PDM microphone.
+ * NOTE: This callback is executed as part of an ISR.
+ * Therefore using `Serial` to print messages inside this function isn't supported.
+ * */
+void onPDMdata() {
+  // Query the number of available bytes
+  int bytesAvailable = PDM.available();
+
+  // Read into the sample buffer
+  PDM.read(sampleBuffer, bytesAvailable);
+
+  // 16-bit, 2 bytes per sample
+  samplesRead = bytesAvailable / 2;
+}
+
